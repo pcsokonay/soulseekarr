@@ -606,11 +606,12 @@ class AlbumSearch:
 
     def _discover_sources(self, tracks, results, filetype, disk_no=None, disk_count=None):
         sources = []
-        blocked = failed_import_record()[1]
+        blocked = blocked_releases()
+        fmt = str(filetype).split()[0].lower() if filetype else ""
         for username, user_results in results.items():
             for peer in user_results.get(filetype, []):
-                if _release_key(username, peer["file_dir"]) in blocked:
-                    logger.debug(f"Skipping a release that already failed import: {username}")
+                if _release_key(username, peer["file_dir"], fmt) in blocked or _release_key(username, peer["file_dir"]) in blocked:
+                    logger.debug(f"Skipping a release already tried for this album: {username}")
                     continue
                 logger.debug(f"Parsing result from user: {username}")
                 match = self.match_directory(tracks, filetype, peer["file_dir"], username)
@@ -1583,11 +1584,15 @@ class AlbumDownload:
         failed = current_task.get("status") == "failed" or current_task.get("result") == "unsuccessful"
         if not failed:
             self.album.state.import_failed = False
+            try:
+                remember_import(self.album, self.candidate, self.files, failed=False)
+            except Exception:
+                logger.exception("Error recording the imported release")
             return
 
         self.album.failure = "Lidarr import failed"
         try:
-            remember_failed_import(self.album, self.candidate)
+            remember_import(self.album, self.candidate, self.files, failed=True)
         except Exception:
             logger.exception("Error recording the failed import")
         try:
@@ -1635,7 +1640,7 @@ class DownloadBatch(list[AlbumDownload]):
                 time.sleep(5)
 
 
-_FAILED_IMPORT_RECORD: dict[str, tuple[dict, frozenset[str]]] = {}
+_FAILED_IMPORT_RECORD: dict[str, tuple[dict, frozenset, frozenset]] = {}
 
 
 def _failed_import_record_path() -> str:
@@ -1644,27 +1649,39 @@ def _failed_import_record_path() -> str:
     return os.path.join(data_dir, "failed_imports.json")
 
 
-def _release_key(username: str, file_dir: str) -> str:
-    """One release: the peer and its folder, the same pair _discover_sources() builds sources from."""
-    return f"{username}\\{file_dir}"
+def _release_key(username, file_dir, fmt="") -> str:
+    """One release: peer, folder and format, built the same way on both sides of the filter."""
+    key = f"{username}\\{file_dir}"
+    return f"{key}|{fmt}" if fmt else key
 
 
-def _read_failed_import_record() -> tuple[dict[str, dict], frozenset[str]]:
-    """Parse the record from disk. Never cached: a writer must see what is really there."""
+def _file_format(files) -> str:
+    """The format class of a grabbed release, read from its own filenames."""
+    for entry in files or []:
+        name = str(entry.get("filename") or "").lower()
+        if name.endswith(".flac"):
+            return "flac"
+        if name.endswith(".mp3"):
+            return "mp3"
+    return ""
+
+
+def _read_failed_import_record() -> tuple[dict, frozenset, frozenset]:
+    """Parse the record from disk: (albums, refused releases, imported-but-still-cutoff releases)."""
     path = _failed_import_record_path()
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        return {}, frozenset()
+        return {}, frozenset(), frozenset()
     except (OSError, ValueError):
         logger.warning("Could not read the failed-import record at %s", path, exc_info=True)
-        return {}, frozenset()
+        return {}, frozenset(), frozenset()
     albums = {str(key): value for key, value in (data.get("albums") or {}).items()}
-    return albums, frozenset(data.get("releases") or [])
+    return albums, frozenset(data.get("refused") or []), frozenset(data.get("imported") or [])
 
 
-def failed_import_record() -> tuple[dict[str, dict], frozenset[str]]:
+def failed_import_record() -> tuple[dict, frozenset, frozenset]:
     """The record, read once per process."""
     path = _failed_import_record_path()
     cached = _FAILED_IMPORT_RECORD.get(path)
@@ -1674,32 +1691,56 @@ def failed_import_record() -> tuple[dict[str, dict], frozenset[str]]:
     return cached
 
 
-def remember_failed_import(album, candidate) -> None:
-    """Persist an album and the exact release(s) Lidarr refused, so a restart cannot re-download them."""
+def blocked_releases() -> frozenset:
+    """Releases not worth grabbing again: refused, or imported and still below the cutoff."""
+    _, refused, imported = failed_import_record()
+    return refused | imported
+
+
+def remember_import(album, candidate, files, failed) -> None:
+    """Record the release Lidarr refused - or imported without clearing the cutoff.
+
+    Both are worth remembering. The second is already in the library at that format, so
+    re-downloading it cannot be an upgrade; without it a below-cutoff album re-grabs the
+    same copy on every cycle.
+    """
     path = _failed_import_record_path()
-    albums, releases = _read_failed_import_record()
+    albums, refused, imported = _read_failed_import_record()
     albums = dict(albums)
     albums[str(album.id)] = {
         "artist": album.artist,
         "title": album.title,
         "failed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
+    fmt = _file_format(files)
     keys = {
-        _release_key(source.username, source.file_dir)
+        _release_key(source.username, source.file_dir, fmt)
         for source in (getattr(candidate, "sources", None) or [])
     }
-    merged = sorted(set(releases) | keys)
+    if failed:
+        refused = set(refused) | keys
+    else:
+        imported = set(imported) | keys
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         tmp_path = path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as fh:
-            json.dump({"albums": albums, "releases": merged}, fh, indent=2, sort_keys=True)
+            json.dump(
+                {"albums": albums, "refused": sorted(refused), "imported": sorted(imported)},
+                fh,
+                indent=2,
+                sort_keys=True,
+            )
         os.replace(tmp_path, path)
     except OSError:
         logger.warning("Could not write the failed-import record at %s", path, exc_info=True)
         return
-    _FAILED_IMPORT_RECORD[path] = (albums, frozenset(merged))
-    logger.info(f"Remembered failed import: {album.artist} - {album.title} ({len(keys)} release(s))")
+    _FAILED_IMPORT_RECORD[path] = (albums, frozenset(refused), frozenset(imported))
+    outcome = "failed import" if failed else "import below cutoff"
+    logger.info(
+        f"Remembered {outcome}: {album.artist} - {album.title} "
+        f"({len(keys)} release(s), {fmt or 'unknown'} format)"
+    )
 
 
 def sanitize_folder_name(folder_name):
